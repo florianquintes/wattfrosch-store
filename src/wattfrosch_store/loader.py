@@ -260,7 +260,7 @@ def load_records(
         return _failed(StoreConnectionError(f"Database not reachable: {exc}"), progress)
     try:
         with translate_db_errors():
-            _check_contract_version(conn)
+            check_contract_version(conn)
             conn.commit()  # close the version-check read before the sync's own transaction
             sync = sync_dims(conn)
             progress.dims_inserted = sync.inserted
@@ -323,7 +323,7 @@ def _failed(error: StoreError, progress: _Progress) -> LoadResult:
     )
 
 
-def _check_contract_version(conn: psycopg.Connection[dict]) -> None:
+def check_contract_version(conn: psycopg.Connection[dict]) -> None:
     """Compare the applied contract version with the module's (Major.Minor)."""
     with conn.cursor() as cur:
         cur.execute(
