@@ -496,6 +496,50 @@ erneuter Lauf -> Endzustand identisch zum fehlerfreien Lauf; leere Datei -> Exit
 Warnung; naiver Zeitstempel in CSV -> Abbruch mit Zeilennummer; `init` gegen
 fehlende DB (DSN mit nicht existierendem `dbname`).
 
+## EXPLAIN ANALYZE: Braucht es einen Index auf `time_id`?
+
+Hypothese: nein — der Grain-PK `(time_id, region_id, metric_id, source_id,
+resolution)` führt mit `time_id` und bedient zeitreihengetriebene Abfragen
+direkt. Messung gegen die Compose-DB (`postgres:16`) mit 368 256 Faktzeilen
+(5 Regionen, 10 Metriken, stündlich, 3 Jahre; `ANALYZE` danach ausgeführt).
+Repräsentative Abfrage — ein Tag, eine Metrik, eine Region:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT m.metric_key, r.region_code, t.ts_utc, f.value
+FROM raw.fact_measurement f
+JOIN raw.dim_time t USING (time_id)
+JOIN raw.dim_region r USING (region_id)
+JOIN raw.dim_metric m USING (metric_id)
+WHERE t.ts_utc >= '2024-06-01T00:00:00Z' AND t.ts_utc < '2024-06-02T00:00:00Z'
+  AND m.metric_key = 'generation.solar' AND r.region_code = 'DE-LU';
+```
+
+Plan (gekürzt):
+
+```
+Nested Loop (actual time=0.074..0.120 rows=24 loops=1)
+  -> Nested Loop
+     -> Bitmap Heap Scan on dim_metric m
+        Index Cond: (metric_key = 'generation.solar'::text)
+     -> Nested Loop
+        -> Bitmap Heap Scan on dim_time t
+           Index Cond: (ts_utc >= '...' AND ts_utc < '...')
+        -> Index Scan using fact_measurement_pkey on fact_measurement f
+           Index Cond: ((time_id = t.time_id) AND (metric_id = m.metric_id))
+```
+
+**Ergebnis:** Der Planner startet bei `dim_time` (Unique-Index auf `ts_utc`)
+und `dim_metric` und greift die Faktzeilen über den PK-Vorspann `(time_id, …)`
+ab — 24 Zeilen in ~0,5 ms. Ein zusätzlicher Index auf `time_id` ist **nicht
+nötig**; die Hypothese bestätigt sich.
+
+Randnotiz: Bei metrikfirst getriebenen Abfragen ohne Zeitfilter („eine Metrik,
+eine Region, komplette Historie") wählt der Planner bei ~370 000 Zeilen noch
+einen (parallelen) Seq Scan — `idx_fact_measurement_lookup`
+(`metric_id, region_id, time_id`) lohnt sich erst bei größeren Datenmengen.
+Das Index-Design für Dashboard-Abfragen bleibt deshalb ein offener Punkt.
+
 ## Fertig, wenn
 - `docker compose up -d db` startet Postgres
 - `init`, `migrate`, `load` sind idempotent
