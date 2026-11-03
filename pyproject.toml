@@ -1,0 +1,48 @@
+[project]
+name = "wattfrosch-store"
+version = "0.1.0"
+description = "Persistenz-Modul: Datenbankschema, Migrationen und idempotenter Loader für MeasurementRecords."
+authors = [
+    { name = "Dr. Florian Quintes", email = "florian@fam-quintes.de" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pyarrow>=26.0.0",
+    "pydantic-settings>=2.16.0",
+    "wattfrosch-contracts",
+]
+
+[project.scripts]
+wattfrosch-store = "wattfrosch_store.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+wattfrosch-contracts = { path = "../wattfrosch-contracts", editable = true }
+
+[tool.ruff]
+# README.md ist die autoritative Spec — ihre handausgerichteten Codeblock-Kommentare
+# nicht umbrechen (ruff format prüft Python-Blöcke in Markdown).
+extend-exclude = ["README.md"]
+
+[tool.pyrefly]
+project-includes = ["src"]
+
+[tool.coverage.run]
+source = ["wattfrosch_store"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.4.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.1",
+    "testcontainers[postgres]>=4.13",
+]

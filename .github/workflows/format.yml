@@ -1,0 +1,44 @@
+name: Format and lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout wattfrosch-store
+        uses: actions/checkout@v4
+        with:
+          path: wattfrosch-store
+
+      - name: Checkout wattfrosch-contracts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/wattfrosch-contracts
+          ref: v0.1.0
+          path: wattfrosch-contracts
+          token: ${{ secrets.CONTRACTS_READ_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: wattfrosch-store/uv.lock
+
+      - name: Install dependencies
+        working-directory: wattfrosch-store
+        run: uv sync --dev --locked
+
+      - name: Check formatting
+        working-directory: wattfrosch-store
+        run: uv run ruff format --check .
+
+      - name: Check linting
+        working-directory: wattfrosch-store
+        run: uv run ruff check .

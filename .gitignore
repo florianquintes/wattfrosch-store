@@ -1,0 +1,67 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+*.whl
+
+# --- Virtualenv / uv ---
+.venv/
+venv/
+# uv.lock  <-- bewusst NICHT ignorieren (reproduzierbare Builds)
+
+# --- Tests / Coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# --- Lint / Typecheck ---
+.ruff_cache/
+.mypy_cache/
+.pyrefly_cache/
+.pyrefly/
+
+# --- Projekt-Artefakte (store) ---
+/data/
+/out/
+/cache/
+*.parquet
+*.csv
+*.json
+
+# Testfixtures sind ausdrücklich eingecheckt (README: tests/fixtures/)
+!tests/fixtures/
+!tests/fixtures/**
+
+# --- Konfiguration / Secrets ---
+AGENTS.md
+TODO.md
+.env
+.env.*
+!.env.example
+*.local
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Docker / Logs ---
+*.log
+logs/
+.dockerignore
