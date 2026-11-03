@@ -38,6 +38,11 @@ source = ["wattfrosch_store"]
 fail_under = 90
 show_missing = true
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests against a real Postgres (compose DB or testcontainer)",
+]
+
 [dependency-groups]
 dev = [
     "pyrefly>=1.4.0",
