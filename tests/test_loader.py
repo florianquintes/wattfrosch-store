@@ -1,20 +1,27 @@
-"""Tests for loader dimension resolution (D1)."""
+"""Tests for loader dimension resolution and load_records (D1/D2)."""
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Self
 
 import psycopg
 import pytest
 from psycopg.rows import dict_row
+from wattfrosch_contracts import CONTRACT_VERSION
+from wattfrosch_contracts.records import MeasurementRecord
 
+import wattfrosch_store.loader as loader_module
+import wattfrosch_store.sync_dims as sync_module
 from wattfrosch_store import StoreError
+from wattfrosch_store.config import Settings
 from wattfrosch_store.loader import (
     DimensionResolver,
     MetricNotFoundError,
     RegionNotFoundError,
     SourceNotFoundError,
+    load_records,
 )
 from wattfrosch_store.migrate import run_init, run_migrations
 from wattfrosch_store.sync_dims import sync_dims
@@ -28,6 +35,7 @@ class _StubCursor:
     def __init__(self, conn: _StubConnection) -> None:
         self._conn = conn
         self._rows: list[dict] = []
+        self._rowcount = 0
 
     def __enter__(self) -> Self:
         return self
@@ -36,13 +44,28 @@ class _StubCursor:
         return False
 
     def execute(self, query: str, params: object = None) -> None:
+        if self._conn.fail_execute_with is not None:
+            raise self._conn.fail_execute_with
         self._conn.statements.append(query)
         self._conn.param_sets.append(params)
         self._rows = []
+        self._rowcount = 1
         for marker, rows in self._conn.results.items():
             if marker in query:
                 self._rows = list(rows)
                 return
+
+    def executemany(self, query: str, params_seq: object) -> None:
+        self._conn.statements.append(query)
+        params_list = list(params_seq)  # type: ignore[arg-type]
+        self._conn.param_sets.append(params_list)
+        self._conn.executemany_calls.append((query, params_list))
+        self._rowcount = len(params_list)
+        if (
+            self._conn.fail_executemany_at is not None
+            and len(self._conn.executemany_calls) >= self._conn.fail_executemany_at
+        ):
+            raise psycopg.Error("simulated batch failure")
 
     def fetchone(self) -> dict | None:
         return self._rows[0] if self._rows else None
@@ -50,15 +73,56 @@ class _StubCursor:
     def fetchall(self) -> list[dict]:
         return self._rows
 
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
 
 class _StubConnection:
-    def __init__(self, results: dict[str, list[dict]] | None = None) -> None:
+    def __init__(
+        self,
+        results: dict[str, list[dict]] | None = None,
+        fail_executemany_at: int | None = None,
+        fail_execute_with: BaseException | None = None,
+    ) -> None:
         self.statements: list[str] = []
         self.param_sets: list[object] = []
         self.results = results or {}
+        self.executemany_calls: list[tuple[str, list[dict]]] = []
+        self.fail_executemany_at = fail_executemany_at
+        self.fail_execute_with = fail_execute_with
+        self.commits = 0
+        self.rollbacks = 0
 
     def cursor(self) -> _StubCursor:
         return _StubCursor(self)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def transaction(self):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    def close(self) -> None:
+        pass
+
+
+def _load_results() -> dict[str, list[dict]]:
+    # markers must not match collect_divergences' "SELECT * FROM raw.dim_*"
+    return {
+        "FROM raw.schema_migration": [
+            {"contract_version": CONTRACT_VERSION},
+        ],
+        "RETURNING time_id": [{"time_id": 11}],
+        "SELECT region_id": [{"region_id": 5}],
+        "SELECT metric_id": [{"metric_id": 7}],
+        "SELECT source_id": [{"source_id": 3}],
+    }
 
 
 def _region_result(region_id: int = 5) -> dict[str, list[dict]]:
@@ -205,6 +269,251 @@ def test_source_not_found_raises_typed_error():
     assert exc_info.value.context == {"source": "unknown-source"}
 
 
+# --- load_records (D2) ---
+
+
+def _record(
+    i: int, region: str = "DE-LU", metric: str = "generation.solar"
+) -> MeasurementRecord:
+    return MeasurementRecord(
+        ts_utc=datetime(2024, 6, 1, i % 24, 0, tzinfo=UTC),
+        region=region,
+        metric=metric,
+        value=100.0 + i,
+        source="energy-charts",
+        resolution="PT1H",
+    )
+
+
+@pytest.fixture
+def no_catalog_rows(monkeypatch):
+    """Empty catalogs: the stub DB holds no dimension rows to compare."""
+    monkeypatch.setattr(sync_module, "REGIONS", {})
+    monkeypatch.setattr(sync_module, "METRICS", {})
+    monkeypatch.setattr(sync_module, "SOURCES", {})
+
+
+@pytest.fixture
+def stub_connect(monkeypatch):
+    """Route load_records' connect() to a stub connection."""
+
+    def _patch(conn: _StubConnection) -> _StubConnection:
+        monkeypatch.setattr(loader_module, "connect", lambda settings: conn)
+        return conn
+
+    return _patch
+
+
+def test_load_records_batches_and_commits(no_catalog_rows, stub_connect):
+    conn = stub_connect(_StubConnection(results=_load_results()))
+    settings = Settings(batch_size=2)
+
+    result = load_records([_record(i) for i in range(5)], settings)
+
+    assert result.status == "ok"
+    assert result.records_read == 5
+    assert result.rows_written == 5
+    assert result.batches_committed == 3
+    assert result.batches_total == 3
+    assert result.divergences == []
+    assert result.error is None
+    # 1 commit for the version-check read + one per batch (2/2/1)
+    assert [len(rows) for _, rows in conn.executemany_calls] == [2, 2, 1]
+    assert conn.commits == 4
+
+
+def test_load_records_fact_upsert_params(no_catalog_rows, stub_connect):
+    conn = stub_connect(_StubConnection(results=_load_results()))
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "ok"
+    upsert_sql, params = conn.executemany_calls[0]
+    assert "INSERT INTO raw.fact_measurement" in upsert_sql
+    assert (
+        "ON CONFLICT (time_id, region_id, metric_id, source_id, resolution)"
+        in upsert_sql
+    )
+    assert "DO UPDATE SET value = EXCLUDED.value, ingested_at = now()" in upsert_sql
+    assert params[0] == {
+        "time_id": 11,
+        "region_id": 5,
+        "metric_id": 7,
+        "source_id": 3,
+        "resolution": "PT1H",
+        "value": 100.0,
+    }
+
+
+def test_load_records_empty_input(no_catalog_rows, stub_connect, caplog):
+    conn = stub_connect(_StubConnection(results=_load_results()))
+
+    with caplog.at_level(logging.WARNING, logger="wattfrosch_store.loader"):
+        result = load_records([], Settings(batch_size=10))
+
+    assert result.status == "empty"
+    assert result.records_read == 0
+    assert result.rows_written == 0
+    assert result.batches_committed == 0
+    assert result.batches_total == 0
+    assert result.error is None
+    assert conn.executemany_calls == []
+    assert any("No records to load" in r.message for r in caplog.records)
+
+
+def test_load_records_batch_failure_rolls_back_and_reports(
+    no_catalog_rows, stub_connect
+):
+    conn = stub_connect(_StubConnection(results=_load_results(), fail_executemany_at=2))
+
+    result = load_records([_record(i) for i in range(5)], Settings(batch_size=2))
+
+    assert result.status == "failed"
+    assert result.batches_committed == 1
+    assert result.batches_total == 2
+    assert result.rows_written == 2  # only the committed first batch
+    assert result.records_read == 4  # 5th record was never consumed
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_batch_failed"
+    message = str(result.error)
+    assert "Batch 2" in message
+    assert "DE-LU" in message
+    assert "generation.solar" in message
+    assert "2024-06-01" in message
+    assert "already committed" in message
+    assert result.error.context["batch"] == 2
+    assert conn.rollbacks == 1
+    assert conn.commits == 2  # version-check read + first batch
+
+
+def test_load_records_unresolvable_region(no_catalog_rows, stub_connect):
+    results = _load_results()
+    del results["SELECT region_id"]  # resolver finds nothing
+    conn = stub_connect(_StubConnection(results=results))
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_region_not_found"
+    assert result.error.context == {
+        "region_code": "DE-LU",
+        "ts_utc": "2024-06-01T00:00:00+00:00",
+    }
+    assert "DE-LU" in str(result.error)
+    assert conn.executemany_calls == []  # failed before any fact was written
+    assert conn.rollbacks == 1
+
+
+def test_load_records_version_mismatch(no_catalog_rows, stub_connect):
+    results = _load_results()
+    results["FROM raw.schema_migration"] = [{"contract_version": "9.9.0"}]
+    conn = stub_connect(_StubConnection(results=results))
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_contract_divergence"
+    assert result.error.context == {
+        "database_version": "9.9.0",
+        "module_version": CONTRACT_VERSION,
+    }
+    assert not any("INSERT INTO raw.dim" in s for s in conn.statements)
+
+
+def test_load_records_no_migrations_applied(no_catalog_rows, stub_connect):
+    results = _load_results()
+    results["FROM raw.schema_migration"] = []
+    stub_connect(_StubConnection(results=results))
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_contract_divergence"
+    assert "migrate" in str(result.error)
+
+
+def test_load_records_connect_failure(no_catalog_rows, monkeypatch):
+    monkeypatch.setattr(
+        loader_module,
+        "connect",
+        lambda settings: (_ for _ in ()).throw(StoreError("not reachable")),
+    )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "not reachable" in str(result.error)
+
+
+def test_load_records_connect_psycopg_error(no_catalog_rows, monkeypatch):
+    monkeypatch.setattr(
+        loader_module,
+        "connect",
+        lambda settings: (_ for _ in ()).throw(psycopg.OperationalError("down")),
+    )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "not reachable" in str(result.error).lower()
+
+
+def test_load_records_missing_table_maps_to_schema_error(no_catalog_rows, stub_connect):
+    conn = stub_connect(
+        _StubConnection(fail_execute_with=psycopg.errors.UndefinedTable("missing"))
+    )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "migrate" in str(result.error)
+    assert conn.rollbacks == 1
+
+
+def test_load_records_unexpected_db_error(no_catalog_rows, stub_connect):
+    exc = psycopg.OperationalError("boom")
+    exc.sqlstate = "XX000"  # not translated by db.py: passes through unchanged
+    conn = stub_connect(_StubConnection(fail_execute_with=exc))
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "Unexpected database error" in str(result.error)
+    assert conn.rollbacks == 1
+
+
+def test_load_records_missing_dim_row_aborts(monkeypatch, stub_connect):
+    # one catalog row, empty DB table -> missing_in_db divergence -> abort
+    from wattfrosch_contracts import REGIONS
+
+    monkeypatch.setattr(sync_module, "REGIONS", {"DE-LU": REGIONS["DE-LU"]})
+    monkeypatch.setattr(sync_module, "METRICS", {})
+    monkeypatch.setattr(sync_module, "SOURCES", {})
+    conn = stub_connect(
+        _StubConnection(
+            results={
+                "FROM raw.schema_migration": [{"contract_version": CONTRACT_VERSION}],
+                "SELECT * FROM raw.dim_region": [],
+            }
+        )
+    )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_contract_divergence"
+    assert ("region", "DE-LU") in result.error.context["missing"]
+    assert conn.executemany_calls == []  # aborted before any fact upsert
+
+
 # --- integration (real DB) ---
 
 
@@ -289,3 +598,131 @@ def test_integration_metric_and_source_resolution(clean_db):
 
     assert metric_id > 0
     assert source_id > 0
+
+
+@pytest.mark.integration
+def test_integration_load_twice_updates_values(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+    settings = Settings(batch_size=2)
+    records = [_record(i) for i in range(5)]
+
+    first = load_records(records, settings)
+    assert first.status == "ok"
+    assert first.dims_inserted > 0
+    assert first.rows_written == 5
+    assert first.batches_committed == 3
+    assert first.batches_total == 3
+
+    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT value, ingested_at FROM raw.fact_measurement ORDER BY time_id"
+        ).fetchall()
+    assert len(rows) == 5
+    assert [r["value"] for r in rows] == [100.0, 101.0, 102.0, 103.0, 104.0]
+    first_ingested = max(r["ingested_at"] for r in rows)
+
+    updated = [
+        _record(
+            i,
+        )
+        for i in range(5)
+    ]
+    for i, rec in enumerate(updated):
+        rec = rec.model_copy(update={"value": 200.0 + i})
+        updated[i] = rec
+    import time
+
+    time.sleep(0.05)
+    second = load_records(updated, settings)
+    assert second.status == "ok"
+    assert second.dims_inserted == 0  # sync re-run inserts nothing
+
+    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT value, ingested_at FROM raw.fact_measurement ORDER BY time_id"
+        ).fetchall()
+    assert len(rows) == 5  # same row count, no duplicates
+    assert [r["value"] for r in rows] == [200.0, 201.0, 202.0, 203.0, 204.0]
+    assert max(r["ingested_at"] for r in rows) > first_ingested
+
+
+@pytest.mark.integration
+def test_integration_unresolvable_region_fails_without_fact_row(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+
+    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
+        sync_dims(conn)
+        # hand-close the DB validity window well before the record's date:
+        # sync is insert-only and will not repair it, the resulting
+        # catalog-vs-DB divergence (valid_to differs) only warns
+        conn.execute(
+            "UPDATE raw.dim_region SET valid_to = '2019-06-01' "
+            "WHERE region_code = 'DE-LU'"
+        )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_region_not_found"
+    assert "DE-LU" in str(result.error)
+    assert "2024-06-01" in str(result.error)
+    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
+        count = conn.execute(
+            "SELECT count(*) AS n FROM raw.fact_measurement"
+        ).fetchone()
+    assert count is not None and count["n"] == 0
+
+
+@pytest.mark.integration
+def test_integration_contract_version_mismatch_fails(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+    with psycopg.connect(
+        clean_db.database_url, row_factory=dict_row, autocommit=True
+    ) as conn:
+        conn.execute("UPDATE raw.schema_migration SET contract_version = '9.9.0'")
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "wattfrosch.store_contract_divergence"
+
+
+@pytest.mark.integration
+def test_integration_empty_input_is_success_with_warning(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+
+    result = load_records([], Settings(batch_size=10))
+
+    assert result.status == "empty"
+    assert result.rows_written == 0
+    assert result.error is None
+
+
+@pytest.mark.integration
+def test_integration_content_divergence_warns_but_loads(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+
+    with psycopg.connect(
+        clean_db.database_url, row_factory=dict_row, autocommit=True
+    ) as conn:
+        sync_dims(conn)
+        conn.execute(
+            "UPDATE raw.dim_metric SET display_name = 'WRONG' "
+            "WHERE metric_key = 'generation.solar'"
+        )
+
+    result = load_records([_record(0)], Settings(batch_size=10))
+
+    assert result.status == "ok"
+    assert result.error is None
+    assert any(
+        d.dimension == "metric" and d.kind == "content_differs"
+        for d in result.divergences
+    )

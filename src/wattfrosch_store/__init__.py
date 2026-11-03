@@ -7,4 +7,6 @@ class StoreError(Exception):
     """Base class for all wattfrosch-store errors."""
 
 
-__all__ = ["StoreError"]
+from wattfrosch_store.loader import LoadResult, load_records
+
+__all__ = ["LoadResult", "StoreError", "load_records"]
