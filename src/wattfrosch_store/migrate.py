@@ -143,6 +143,10 @@ def run_migrations(settings: Settings) -> MigrationResult:
             applied_db = {row["migration_id"] for row in cur.fetchall()}
             conn.commit()  # close the read transaction so each file gets its own
             pending, skipped = _plan(files, applied_db)
+            if pending:
+                logger.info(
+                    "Pending migrations: %s", ", ".join(f.name for f in pending)
+                )
 
             for path in pending:
                 logger.info("Applying migration %s", path.name)

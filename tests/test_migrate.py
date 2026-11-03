@@ -1,12 +1,15 @@
 """Tests for the migration runner (B2): T1 fresh apply, T2 idempotent, T7 lock."""
 
+from __future__ import annotations
+
+import contextlib
 from datetime import timedelta
 from pathlib import Path
+from typing import Self
 
 import psycopg
 import pytest
 from psycopg.rows import dict_row
-from test_db import _db_available
 from wattfrosch_contracts import CONTRACT_VERSION
 
 from wattfrosch_store import StoreError
@@ -85,14 +88,6 @@ def test_discover_real_migrations_dir():
     assert files[0].stem == "0001_initial"
 
 
-@pytest.fixture
-def clean_db():
-    settings = load_settings()
-    with psycopg.connect(settings.database_url, autocommit=True) as conn:
-        conn.execute("DROP SCHEMA IF EXISTS raw CASCADE")
-    yield settings
-
-
 def _log_rows(settings):
     with psycopg.connect(
         settings.database_url, autocommit=True, row_factory=dict_row
@@ -114,7 +109,6 @@ def _table_names(settings, schema: str) -> set[str]:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not _db_available(), reason="compose DB not running")
 def test_t1_fresh_apply(clean_db):
     result = run_migrations(clean_db)
 
@@ -136,7 +130,6 @@ def test_t1_fresh_apply(clean_db):
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not _db_available(), reason="compose DB not running")
 def test_t2_run_twice_is_idempotent(clean_db):
     run_migrations(clean_db)
 
@@ -147,7 +140,6 @@ def test_t2_run_twice_is_idempotent(clean_db):
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not _db_available(), reason="compose DB not running")
 def test_t7_lock_timeout_aborts(clean_db, monkeypatch):
     settings = load_settings()
     with psycopg.connect(settings.database_url, autocommit=True) as holder:
@@ -164,3 +156,206 @@ def test_t7_lock_timeout_aborts(clean_db, monkeypatch):
     # the aborted run left the lock free: a normal run succeeds now
     result = run_migrations(settings)
     assert result.applied == ("0001_initial",)
+
+
+# --- unit tests for run_migrations with a stub connection (no DB) ---
+
+
+class _StubCursor:
+    def __init__(self, conn: _StubConnection) -> None:
+        self._conn = conn
+        self.statements: list[str] = []
+        self.rows: list[dict] = []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def execute(self, query: str, params: object = None) -> None:
+        self.statements.append(query)
+        if self._conn.fail_on and self._conn.fail_on in query:
+            raise self._conn.fail_error
+        if "SELECT migration_id" in query:
+            self.rows = [{"migration_id": m} for m in self._conn.applied_db]
+
+    def fetchall(self) -> list[dict]:
+        return self.rows
+
+
+class _StubConnection:
+    def __init__(
+        self, applied_db: list[str] | None = None, fail_on: str | None = None
+    ) -> None:
+        self.applied_db = applied_db or []
+        self.fail_on = fail_on
+        self.fail_error: Exception = psycopg.errors.UndefinedTable("boom")
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+        self.unlocked = False
+        self.cursors: list[_StubCursor] = []
+
+    def cursor(self) -> _StubCursor:
+        cur = _StubCursor(self)
+        self.cursors.append(cur)
+        return cur
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+    def execute(self, query: str, params: object = None) -> None:
+        if "pg_advisory_unlock" in query:
+            self.unlocked = True
+
+    def transaction(self):
+        return contextlib.nullcontext()
+
+
+def _run_with_stub(monkeypatch, conn: _StubConnection, files: tuple[Path, ...]):
+    import wattfrosch_store.migrate as migrate_module
+
+    monkeypatch.setattr(migrate_module, "connect", lambda settings: conn)
+    monkeypatch.setattr(migrate_module, "discover_migrations", lambda: files)
+    return run_migrations(load_settings())
+
+
+def test_run_applies_pending_files(tmp_path, monkeypatch):
+    files = (
+        tmp_path / "0001_initial.sql",
+        tmp_path / "0002_next.sql",
+    )
+    for path in files:
+        path.write_text(f"-- migration {path.stem}\n")
+    conn = _StubConnection()
+
+    result = _run_with_stub(monkeypatch, conn, files)
+
+    assert result.applied == ("0001_initial", "0002_next")
+    assert result.skipped == ()
+    assert conn.unlocked and conn.closed
+    # file content was executed within the run
+    statements = conn.cursors[0].statements
+    assert any("-- migration 0001_initial" in s for s in statements)
+    assert any("-- migration 0002_next" in s for s in statements)
+
+
+def test_run_records_log_rows(tmp_path, monkeypatch):
+    migration = tmp_path / "0001_initial.sql"
+    migration.write_text("-- ok\n")
+    files = (migration,)
+    conn = _StubConnection()
+    captured: list[tuple] = []
+
+    import wattfrosch_store.migrate as migrate_module
+
+    original_execute = _StubCursor.execute
+
+    def spy_execute(self, query, params=None):
+        original_execute(self, query, params)
+        if params is not None and "INSERT INTO raw.schema_migration" in query:
+            captured.append(params)
+
+    monkeypatch.setattr(_StubCursor, "execute", spy_execute)
+    monkeypatch.setattr(migrate_module, "connect", lambda settings: conn)
+    monkeypatch.setattr(migrate_module, "discover_migrations", lambda: files)
+
+    result = run_migrations(load_settings())
+
+    assert result.applied == ("0001_initial",)
+    assert captured == [("0001_initial", CONTRACT_VERSION)]
+    assert conn.unlocked and conn.closed
+
+
+def test_run_skips_already_applied(monkeypatch):
+    files = (Path("0001_initial.sql"),)
+    conn = _StubConnection(applied_db=["0001_initial"])
+
+    result = _run_with_stub(monkeypatch, conn, files)
+
+    assert result.applied == ()
+    assert result.skipped == ("0001_initial",)
+
+
+def test_run_aborts_when_db_newer(monkeypatch):
+    conn = _StubConnection(applied_db=["0009_missing"])
+    with pytest.raises(MigrationStateError, match="newer than this module"):
+        _run_with_stub(monkeypatch, conn, (Path("0001_initial.sql"),))
+    assert conn.closed
+
+
+def test_run_wraps_apply_failure(tmp_path, monkeypatch, caplog):
+    good = tmp_path / "0001_initial.sql"
+    good.write_text("-- ok\n")
+    bad = tmp_path / "0002_bad.sql"
+    bad.write_text("-- boom marker\nBOOM;\n")
+    conn = _StubConnection(applied_db=["0001_initial"], fail_on="BOOM")
+
+    with (
+        caplog.at_level("INFO"),
+        pytest.raises(MigrationApplyError, match="0002_bad.sql failed"),
+    ):
+        _run_with_stub(monkeypatch, conn, (good, bad))
+
+    assert conn.closed and conn.unlocked
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages.index("Applying migration 0002_bad.sql") < len(messages)
+
+
+def test_run_logs_pending_before_applying(tmp_path, monkeypatch, caplog):
+    files = (
+        tmp_path / "0001_initial.sql",
+        tmp_path / "0002_next.sql",
+    )
+    for path in files:
+        path.write_text("-- ok\n")
+    conn = _StubConnection()
+
+    with caplog.at_level("INFO"):
+        _run_with_stub(monkeypatch, conn, files)
+
+    messages = [r.getMessage() for r in caplog.records]
+    pending_idx = next(
+        i for i, m in enumerate(messages) if m.startswith("Pending migrations")
+    )
+    apply_idx = next(
+        i for i, m in enumerate(messages) if m.startswith("Applying migration")
+    )
+    assert pending_idx < apply_idx
+
+
+def test_run_lock_timeout_resets_and_closes(monkeypatch):
+    conn = _StubConnection(fail_on="pg_advisory_lock")
+    conn.fail_error = psycopg.errors.LockNotAvailable("held elsewhere")
+
+    with pytest.raises(MigrationLockTimeoutError, match="already running"):
+        _run_with_stub(monkeypatch, conn, (Path("0001_initial.sql"),))
+
+    assert conn.rollbacks >= 1
+    assert conn.closed
+    # lock_timeout was set before locking and reset to 0 afterwards
+    lock_timeout_calls = [s for s in conn.cursors[0].statements if "lock_timeout" in s]
+    assert len(lock_timeout_calls) >= 2
+
+
+def test_run_swallows_unlock_failure(tmp_path, monkeypatch):
+    migration = tmp_path / "0001_initial.sql"
+    migration.write_text("-- ok\n")
+    conn = _StubConnection()
+
+    def broken_execute(query: str, params: object = None) -> None:
+        raise psycopg.errors.OperationalError("connection gone")
+
+    monkeypatch.setattr(conn, "execute", broken_execute)
+
+    result = _run_with_stub(monkeypatch, conn, (migration,))
+
+    assert result.applied == ("0001_initial",)
+    assert conn.closed  # teardown completed despite the failed unlock
