@@ -3,7 +3,6 @@
 import subprocess
 from pathlib import Path
 
-import pyarrow
 import pytest
 
 import wattfrosch_store.cli as cli_module
@@ -225,14 +224,9 @@ def test_load_empty_exit_0_with_warning(fake_load, capsys, tmp_path):
     assert "no records" in capsys.readouterr().err
 
 
-def test_load_unreadable_file_exit_1(monkeypatch, capsys, tmp_path):
-    path = tmp_path / "corrupt.csv"
-    path.write_text("stub")
-
-    def broken_read(path):
-        raise pyarrow.ArrowInvalid("Parquet magic bytes not found")
-
-    monkeypatch.setattr(cli_module, "read_records", broken_read)
+def test_load_unreadable_file_exit_1(capsys, tmp_path):
+    path = tmp_path / "corrupt.parquet"
+    path.write_bytes(b"not a parquet file")
 
     assert main(["load", "--from-file", str(path)]) == 1
     assert "Cannot read" in capsys.readouterr().err
@@ -385,7 +379,8 @@ def test_verify_check_values_reports_outliers_exit_0(fake_verify, capsys):
 
 
 @pytest.mark.integration
-def test_console_script_against_compose_db(clean_db):
+def test_console_script_against_real_db(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     first = subprocess.run(
         ["uv", "run", "wattfrosch-store", "migrate"],
         check=False,
@@ -410,7 +405,8 @@ def test_console_script_against_compose_db(clean_db):
 
 
 @pytest.mark.integration
-def test_init_console_script(clean_db):
+def test_init_console_script(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     first = subprocess.run(
         ["uv", "run", "wattfrosch-store", "init"],
         check=False,
@@ -457,7 +453,8 @@ def _store(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.integration
-def test_load_console_script_paths(clean_db):
+def test_load_console_script_paths(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     assert _store("init").returncode == 0
     assert _store("migrate").returncode == 0
 

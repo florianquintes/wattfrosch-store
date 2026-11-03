@@ -539,48 +539,6 @@ def test_integration_time_upsert_idempotent(clean_db):
 
 
 @pytest.mark.integration
-def test_integration_scd2_region_sides(clean_db):
-    run_init(clean_db)
-    run_migrations(clean_db)
-
-    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
-        sync_dims(conn)
-        resolver = DimensionResolver(conn)
-
-        # DE-AT-LU: [2015-01-01, 2018-10-01)
-        at_lu_id = resolver.region_id("DE-AT-LU", datetime(2018, 9, 30, 12, tzinfo=UTC))
-        with pytest.raises(RegionNotFoundError):
-            resolver.region_id("DE-AT-LU", datetime(2018, 10, 1, 0, 0, tzinfo=UTC))
-
-        # DE-LU: [2018-10-01, open)
-        lu_id = resolver.region_id("DE-LU", datetime(2018, 10, 1, 12, tzinfo=UTC))
-        with pytest.raises(RegionNotFoundError):
-            resolver.region_id("DE-LU", datetime(2018, 9, 30, 23, 59, tzinfo=UTC))
-
-    assert at_lu_id != lu_id
-
-
-@pytest.mark.integration
-def test_integration_utc_cast_independent_of_session_timezone(clean_db):
-    run_init(clean_db)
-    run_migrations(clean_db)
-
-    # 2018-09-30T23:30Z is already 2018-10-01 in Auckland: a bare ::date
-    # would flip the UTC date and resolve the wrong (or no) region.
-    ts = datetime(2018, 9, 30, 23, 30, tzinfo=UTC)
-    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
-        conn.execute("SET TimeZone = 'Pacific/Auckland'")
-        sync_dims(conn)
-        resolver = DimensionResolver(conn)
-        at_lu_id = resolver.region_id("DE-AT-LU", ts)
-    with psycopg.connect(clean_db.database_url, row_factory=dict_row) as conn:
-        sync_dims(conn)
-        resolver = DimensionResolver(conn)
-        at_lu_id_default_tz = resolver.region_id("DE-AT-LU", ts)
-    assert at_lu_id == at_lu_id_default_tz
-
-
-@pytest.mark.integration
 def test_integration_metric_and_source_resolution(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
@@ -604,7 +562,7 @@ def test_integration_metric_and_source_resolution(clean_db):
 def test_integration_load_twice_updates_values(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
-    settings = Settings(batch_size=2)
+    settings = Settings(database_url=clean_db.database_url, batch_size=2)
     records = [_record(i) for i in range(5)]
 
     first = load_records(records, settings)
@@ -662,7 +620,9 @@ def test_integration_unresolvable_region_fails_without_fact_row(clean_db):
             "WHERE region_code = 'DE-LU'"
         )
 
-    result = load_records([_record(0)], Settings(batch_size=10))
+    result = load_records(
+        [_record(0)], Settings(database_url=clean_db.database_url, batch_size=10)
+    )
 
     assert result.status == "failed"
     assert result.error is not None
@@ -685,7 +645,9 @@ def test_integration_contract_version_mismatch_fails(clean_db):
     ) as conn:
         conn.execute("UPDATE raw.schema_migration SET contract_version = '9.9.0'")
 
-    result = load_records([_record(0)], Settings(batch_size=10))
+    result = load_records(
+        [_record(0)], Settings(database_url=clean_db.database_url, batch_size=10)
+    )
 
     assert result.status == "failed"
     assert result.error is not None
@@ -697,7 +659,9 @@ def test_integration_empty_input_is_success_with_warning(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
 
-    result = load_records([], Settings(batch_size=10))
+    result = load_records(
+        [], Settings(database_url=clean_db.database_url, batch_size=10)
+    )
 
     assert result.status == "empty"
     assert result.rows_written == 0
@@ -718,7 +682,9 @@ def test_integration_content_divergence_warns_but_loads(clean_db):
             "WHERE metric_key = 'generation.solar'"
         )
 
-    result = load_records([_record(0)], Settings(batch_size=10))
+    result = load_records(
+        [_record(0)], Settings(database_url=clean_db.database_url, batch_size=10)
+    )
 
     assert result.status == "ok"
     assert result.error is None

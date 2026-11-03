@@ -60,6 +60,10 @@ def read_records(path: Path) -> Iterator[MeasurementRecord]:
     all formats; the caller decides how much to consume (a partially
     consumed generator simply leaves the file to be closed by the garbage
     collector).
+
+    Extension and (for parquet) the file footer are validated eagerly —
+    before the first record is requested — so a wrong or unreadable input
+    aborts before the loader opens a database connection.
     """
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_FORMATS:
@@ -68,15 +72,16 @@ def read_records(path: Path) -> Iterator[MeasurementRecord]:
             f"Supported formats: {', '.join(SUPPORTED_FORMATS)}"
         )
     if suffix == ".parquet":
-        yield from _read_parquet(path)
-    elif suffix == ".csv":
-        yield from _read_csv(path)
-    else:
-        yield from _read_ndjson(path)
+        parquet_file = pq.ParquetFile(str(path))
+        return _iter_parquet(parquet_file, path)
+    if suffix == ".csv":
+        return _iter_csv(path)
+    return _iter_ndjson(path)
 
 
-def _read_parquet(path: Path) -> Iterator[MeasurementRecord]:
-    parquet_file = pq.ParquetFile(str(path))
+def _iter_parquet(
+    parquet_file: pq.ParquetFile, path: Path
+) -> Iterator[MeasurementRecord]:
     ordinal = 0  # parquet has no file lines; report the record ordinal
     for batch in parquet_file.iter_batches(batch_size=_READ_BATCH_SIZE):
         for row in batch.to_pylist():
@@ -84,7 +89,7 @@ def _read_parquet(path: Path) -> Iterator[MeasurementRecord]:
             yield _validated(row, ordinal, path)
 
 
-def _read_csv(path: Path) -> Iterator[MeasurementRecord]:
+def _iter_csv(path: Path) -> Iterator[MeasurementRecord]:
     # ts_utc is forced to a string: pyarrow's own timestamp inference is
     # neither strict nor line-aware, and naive timestamps must be rejected
     # with a line number instead of being silently parsed.
@@ -100,7 +105,7 @@ def _read_csv(path: Path) -> Iterator[MeasurementRecord]:
         reader.close()
 
 
-def _read_ndjson(path: Path) -> Iterator[MeasurementRecord]:
+def _iter_ndjson(path: Path) -> Iterator[MeasurementRecord]:
     with path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, start=1):
             stripped = line.strip()

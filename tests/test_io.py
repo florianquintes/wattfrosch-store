@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pyarrow
 import pytest
 from wattfrosch_contracts.records import MeasurementRecord
 
@@ -295,6 +296,16 @@ def test_read_parquet_rejects_naive_ts_column(tmp_path):
 # --- format detection ---
 
 
+def test_read_corrupt_parquet_raises_eagerly(tmp_path):
+    # the parquet footer is opened before the first record is requested, so
+    # the CLI maps this to "Cannot read" (exit 1) instead of a DB error
+    path = tmp_path / "corrupt.parquet"
+    path.write_bytes(b"garbage")
+
+    with pytest.raises(pyarrow.ArrowInvalid):
+        read_records(path)
+
+
 def test_read_unknown_extension_lists_supported_formats(tmp_path):
     path = tmp_path / "data.txt"
     path.write_text("whatever")
@@ -331,7 +342,7 @@ def test_integration_fixture_loads_through_load_records(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
 
-    result = load_records(read_records(FIXTURES / "scd2_grenze.parquet"))
+    result = load_records(read_records(FIXTURES / "scd2_grenze.parquet"), clean_db)
 
     assert result.status == "ok"
     assert result.records_read == 4

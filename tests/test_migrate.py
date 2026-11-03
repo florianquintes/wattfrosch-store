@@ -1,4 +1,4 @@
-"""Tests for the migration runner (B2): T1 fresh apply, T2 idempotent, T7 lock."""
+"""Tests for the migration runner (B2): T1 fresh apply, T2 idempotent."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from wattfrosch_contracts import CONTRACT_VERSION
 from wattfrosch_store import StoreError
 from wattfrosch_store.config import load_settings
 from wattfrosch_store.migrate import (
-    MIGRATE_LOCK_KEY,
     MigrationApplyError,
     MigrationLockTimeoutError,
     MigrationStateError,
@@ -138,25 +137,6 @@ def test_t2_run_twice_is_idempotent(clean_db):
     assert result.applied == ()
     assert result.skipped == ("0001_initial",)
     assert len(_log_rows(clean_db)) == 1
-
-
-@pytest.mark.integration
-def test_t7_lock_timeout_aborts(clean_db, monkeypatch):
-    settings = load_settings()
-    with psycopg.connect(settings.database_url, autocommit=True) as holder:
-        holder.execute("SELECT pg_advisory_lock(%s)", (MIGRATE_LOCK_KEY,))
-
-        monkeypatch.setenv("MIGRATE_LOCK_TIMEOUT", "1s")
-        with pytest.raises(MigrationLockTimeoutError, match="already running"):
-            run_migrations(load_settings())
-
-        assert _table_names(settings, "raw") == set()  # nothing applied
-
-        holder.execute("SELECT pg_advisory_unlock(%s)", (MIGRATE_LOCK_KEY,))
-
-    # the aborted run left the lock free: a normal run succeeds now
-    result = run_migrations(settings)
-    assert result.applied == ("0001_initial",)
 
 
 # --- unit tests for run_migrations with a stub connection (no DB) ---

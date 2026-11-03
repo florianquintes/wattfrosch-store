@@ -127,20 +127,9 @@ def test_store_error_hierarchy():
         assert issubclass(cls, StoreError)
 
 
-def _db_available() -> bool:
-    try:
-        with psycopg.connect(load_settings().database_url, connect_timeout=2):
-            return True
-    except psycopg.Error:
-        return False
-
-
 @pytest.mark.integration
-@pytest.mark.skipif(not _db_available(), reason="compose DB not running")
-def test_connect_against_real_db():
-    settings = load_settings()
-
-    with connect(settings) as conn:
+def test_connect_against_real_db(db_settings):
+    with connect(db_settings) as conn:
         assert conn.info.parameter_status("server_version") is not None
         with conn.cursor() as cur:
             cur.execute("SELECT 1 AS one")

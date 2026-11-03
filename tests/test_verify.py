@@ -266,7 +266,8 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.integration
-def test_t4_load_with_divergence_warns_exit_0(clean_db):
+def test_t4_load_with_divergence_warns_exit_0(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     run_init(clean_db)
     run_migrations(clean_db)
 
@@ -288,7 +289,8 @@ def test_t4_load_with_divergence_warns_exit_0(clean_db):
 
 
 @pytest.mark.integration
-def test_t4_verify_with_divergence_exit_2(clean_db):
+def test_t4_verify_with_divergence_exit_2(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     run_init(clean_db)
     run_migrations(clean_db)
     assert _run("load", "--from-file", "tests/fixtures/valid.ndjson").returncode == 0
@@ -307,7 +309,8 @@ def test_t4_verify_with_divergence_exit_2(clean_db):
 
 
 @pytest.mark.integration
-def test_verify_fresh_database_exit_0_with_empty_notice(clean_db):
+def test_verify_fresh_database_exit_0_with_empty_notice(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     run_init(clean_db)
     run_migrations(clean_db)
 
@@ -317,7 +320,8 @@ def test_verify_fresh_database_exit_0_with_empty_notice(clean_db):
 
 
 @pytest.mark.integration
-def test_verify_after_load_exit_0(clean_db):
+def test_verify_after_load_exit_0(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     run_init(clean_db)
     run_migrations(clean_db)
     assert _run("load", "--from-file", "tests/fixtures/valid.ndjson").returncode == 0
@@ -328,7 +332,8 @@ def test_verify_after_load_exit_0(clean_db):
 
 
 @pytest.mark.integration
-def test_verify_check_values_reports_outliers_exit_0(clean_db):
+def test_verify_check_values_reports_outliers_exit_0(clean_db, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", clean_db.database_url)
     run_init(clean_db)
     run_migrations(clean_db)
     assert _run("load", "--from-file", "tests/fixtures/valid.ndjson").returncode == 0
