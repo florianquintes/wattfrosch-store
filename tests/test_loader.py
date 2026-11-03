@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Self
+from typing import Any, Self
 
 import psycopg
 import pytest
@@ -559,7 +559,7 @@ def test_integration_metric_and_source_resolution(clean_db):
 
 
 @pytest.mark.integration
-def test_integration_load_twice_updates_values(clean_db):
+def test_t3_load_twice_updates_values(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
     settings = Settings(database_url=clean_db.database_url, batch_size=2)
@@ -606,7 +606,7 @@ def test_integration_load_twice_updates_values(clean_db):
 
 
 @pytest.mark.integration
-def test_integration_unresolvable_region_fails_without_fact_row(clean_db):
+def test_t6_unresolvable_region_fails_without_fact_row(clean_db):
     run_init(clean_db)
     run_migrations(clean_db)
 
@@ -634,6 +634,92 @@ def test_integration_unresolvable_region_fails_without_fact_row(clean_db):
             "SELECT count(*) AS n FROM raw.fact_measurement"
         ).fetchone()
     assert count is not None and count["n"] == 0
+
+
+class _FlakyCursor:
+    """Cursor proxy that fails the Nth ``executemany`` call."""
+
+    def __init__(self, inner: Any, state: dict[str, int]) -> None:
+        self._inner = inner
+        self._state = state
+
+    def __enter__(self) -> Self:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return self._inner.__exit__(*args)
+
+    def executemany(self, sql: str, params: object) -> None:
+        self._state["calls"] += 1
+        if self._state["calls"] == self._state["fail_at"]:
+            raise psycopg.Error("injected batch failure")
+        self._inner.executemany(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _FlakyConnection:
+    """Connection proxy delegating everything except ``cursor()``."""
+
+    def __init__(self, inner: Any, fail_at: int) -> None:
+        self._inner = inner
+        self._state = {"calls": 0, "fail_at": fail_at}
+
+    def cursor(self, *args: object, **kwargs: object) -> _FlakyCursor:
+        return _FlakyCursor(self._inner.cursor(*args, **kwargs), self._state)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _fact_rows(settings: Settings) -> list[dict]:
+    with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT t.ts_utc, r.region_code, m.metric_key, s.source_key, "
+            "f.resolution, f.value "
+            "FROM raw.fact_measurement f "
+            "JOIN raw.dim_time t USING (time_id) "
+            "JOIN raw.dim_region r USING (region_id) "
+            "JOIN raw.dim_metric m USING (metric_id) "
+            "JOIN raw.dim_source s USING (source_id) "
+            "ORDER BY t.ts_utc, r.region_code, m.metric_key"
+        ).fetchall()
+
+
+@pytest.mark.integration
+def test_integration_batch_failure_rerun_matches_clean_state(clean_db, monkeypatch):
+    """Failing batch mid-run, then re-run: end state == pristine clean run."""
+    run_init(clean_db)
+    run_migrations(clean_db)
+    settings = Settings(database_url=clean_db.database_url, batch_size=2)
+    records = [_record(i) for i in range(5)]
+
+    real_connect = loader_module.connect
+
+    def flaky_connect(s: Settings) -> _FlakyConnection:
+        return _FlakyConnection(real_connect(s), fail_at=2)
+
+    monkeypatch.setattr(loader_module, "connect", flaky_connect)
+    first = load_records(records, settings)
+    assert first.status == "failed"
+    assert first.batches_committed == 1  # first batch is committed
+    assert first.rows_written == 2
+
+    monkeypatch.setattr(loader_module, "connect", real_connect)
+    second = load_records(records, settings)
+    assert second.status == "ok"
+    assert second.rows_written == 5  # re-run upserts everything
+
+    # reference: the same records into a pristine database = the clean run
+    ref_url = clean_db.database_url.rsplit("/", 1)[0] + "/wattfrosch_ref"
+    ref = Settings(database_url=ref_url, batch_size=2)
+    assert run_init(ref).db_created is True
+    run_migrations(ref)
+    assert load_records(records, ref).status == "ok"
+
+    assert _fact_rows(settings) == _fact_rows(ref)
 
 
 @pytest.mark.integration

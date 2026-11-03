@@ -468,6 +468,12 @@ def test_load_console_script_paths(clean_db, monkeypatch):
     assert naive.returncode == 2, naive.stderr
     assert "store_validation_failed" in naive.stderr
     assert "without timezone" in naive.stderr
+    assert "line 2" in naive.stderr
+
+    # empty file -> exit 0 + warning
+    empty = _store("load", "--from-file", str(FIXTURES / "empty.csv"))
+    assert empty.returncode == 0, empty.stderr
+    assert "no records" in empty.stderr
 
     # parquet is supported -> exit 0
     parquet = _store("load", "--from-file", str(FIXTURES / "scd2_grenze.parquet"))
