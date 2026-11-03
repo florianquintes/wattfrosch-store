@@ -22,6 +22,7 @@ from wattfrosch_store.migrate import (
     _lock_timeout_literal,
     _plan,
     discover_migrations,
+    run_init,
     run_migrations,
 )
 
@@ -227,6 +228,124 @@ def _run_with_stub(monkeypatch, conn: _StubConnection, files: tuple[Path, ...]):
     return run_migrations(load_settings())
 
 
+# --- unit tests for run_init with stub connections (no DB) ---
+
+
+class _StubMaintenanceCursor:
+    def __init__(self, conn: _StubMaintenanceConnection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def execute(self, query: str, params: object = None) -> None:
+        self._conn.statements.append(query)
+        if "pg_database" in query:
+            self._conn.db_row = {"?column?": 1} if self._conn.db_exists else None
+        elif self._conn.create_error is not None:
+            raise self._conn.create_error
+
+    def fetchone(self) -> dict | None:
+        return self._conn.db_row
+
+
+class _StubMaintenanceConnection:
+    def __init__(self, db_exists: bool, create_error: Exception | None = None) -> None:
+        self.db_exists = db_exists
+        self.create_error = create_error
+        self.db_row: dict | None = None
+        self.statements: list[str] = []
+        self.connect_dsn = ""
+        self.connect_kwargs: dict = {}
+
+    def cursor(self) -> _StubMaintenanceCursor:
+        return _StubMaintenanceCursor(self)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+def _run_init_with_stubs(
+    monkeypatch,
+    maintenance: _StubMaintenanceConnection,
+    target: _StubConnection,
+):
+    import wattfrosch_store.migrate as migrate_module
+
+    def fake_psycopg_connect(dsn, **kwargs):
+        maintenance.connect_dsn = dsn
+        maintenance.connect_kwargs = kwargs
+        return maintenance
+
+    monkeypatch.setattr(migrate_module.psycopg, "connect", fake_psycopg_connect)
+    monkeypatch.setattr(migrate_module, "connect", lambda settings: target)
+    return run_init(load_settings())
+
+
+def test_init_creates_missing_database(monkeypatch):
+    maintenance = _StubMaintenanceConnection(db_exists=False)
+    target = _StubConnection()
+
+    result = _run_init_with_stubs(monkeypatch, maintenance, target)
+
+    assert result.db_created is True
+    assert result.applied == ()
+    assert result.pending == ("0001_initial",)
+    assert "dbname=postgres" in maintenance.connect_dsn
+    assert maintenance.connect_kwargs["autocommit"] is True
+    assert len(maintenance.statements) == 2  # check + CREATE DATABASE
+    assert target.closed
+
+
+def test_init_skips_existing_database(monkeypatch):
+    maintenance = _StubMaintenanceConnection(db_exists=True)
+    target = _StubConnection(applied_db=["0001_initial"])
+
+    result = _run_init_with_stubs(monkeypatch, maintenance, target)
+
+    assert result.db_created is False
+    assert result.applied == ("0001_initial",)
+    assert result.pending == ()
+    assert len(maintenance.statements) == 1  # check only, no CREATE DATABASE
+
+
+def test_init_tolerates_duplicate_database(monkeypatch):
+    maintenance = _StubMaintenanceConnection(
+        db_exists=False,
+        create_error=psycopg.errors.DuplicateDatabase("parallel init won"),
+    )
+
+    result = _run_init_with_stubs(monkeypatch, maintenance, _StubConnection())
+
+    assert result.db_created is False
+
+
+def test_init_missing_createdb_privilege(monkeypatch):
+    maintenance = _StubMaintenanceConnection(
+        db_exists=False,
+        create_error=psycopg.errors.InsufficientPrivilege("no CREATEDB"),
+    )
+
+    with pytest.raises(StoreError, match="docker compose up -d db"):
+        _run_init_with_stubs(monkeypatch, maintenance, _StubConnection())
+
+
+def test_init_fails_when_db_newer(monkeypatch):
+    maintenance = _StubMaintenanceConnection(db_exists=True)
+    target = _StubConnection(applied_db=["0009_missing"])
+
+    with pytest.raises(MigrationStateError, match="newer than this module"):
+        _run_init_with_stubs(monkeypatch, maintenance, target)
+
+    assert target.closed
+
+
 def test_run_applies_pending_files(tmp_path, monkeypatch):
     files = (
         tmp_path / "0001_initial.sql",
@@ -359,3 +478,28 @@ def test_run_swallows_unlock_failure(tmp_path, monkeypatch):
 
     assert result.applied == ("0001_initial",)
     assert conn.closed  # teardown completed despite the failed unlock
+
+
+# --- integration tests for run_init (C1) ---
+
+
+@pytest.mark.integration
+def test_init_fresh_and_idempotent(clean_db):
+    first = run_init(clean_db)
+
+    assert first.db_created is False  # compose DB exists via POSTGRES_DB
+    assert first.applied == ()
+    assert first.pending == ("0001_initial",)
+
+    second = run_init(clean_db)
+    assert second == first  # idempotent
+
+
+@pytest.mark.integration
+def test_init_migrate_flow(clean_db):
+    run_init(clean_db)
+    run_migrations(clean_db)
+
+    status = run_init(clean_db)
+    assert status.applied == ("0001_initial",)
+    assert status.pending == ()

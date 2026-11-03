@@ -26,6 +26,17 @@ CONNECT_RETRY_DELAY_S = 2.0
 
 _UNREACHABLE_SQLSTATES = frozenset({"08001", "08006"})
 
+# Bootstrapped by init/the migration runner, never by a migration file.
+BOOTSTRAP_SQL = """
+CREATE SCHEMA IF NOT EXISTS raw;
+
+CREATE TABLE IF NOT EXISTS raw.schema_migration (
+    migration_id     text PRIMARY KEY,
+    contract_version text NOT NULL,
+    applied_at       timestamptz NOT NULL DEFAULT now()
+)
+"""
+
 
 class StoreConnectionError(StoreError):
     """The database is not reachable."""

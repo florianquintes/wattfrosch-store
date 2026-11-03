@@ -19,7 +19,7 @@ from typing import Final, NoReturn
 
 from wattfrosch_store import StoreError
 from wattfrosch_store.config import ConfigError, load_settings
-from wattfrosch_store.migrate import run_migrations
+from wattfrosch_store.migrate import run_init, run_migrations
 
 _EXIT_OK: Final = 0
 _EXIT_CONFIG: Final = 1
@@ -39,6 +39,10 @@ def _build_parser() -> _ArgumentParser:
         description="Postgres persistence module for MeasurementRecords.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser(
+        "init",
+        help="create database, schema raw and log table if missing (no schema DDL)",
+    )
     subparsers.add_parser("migrate", help="apply pending migrations")
     return parser
 
@@ -73,6 +77,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"migrate: nothing to do ({len(result.skipped)} already applied)",
                     file=sys.stderr,
                 )
+        elif args.command == "init":
+            result = run_init(settings)
+            state = "created" if result.db_created else "present"
+            print(f"init: database {state}", file=sys.stderr)
+            applied = ", ".join(result.applied) if result.applied else "none"
+            print(f"init: applied migrations: {applied}", file=sys.stderr)
+            if result.pending:
+                print(
+                    f"init: pending migrations: {', '.join(result.pending)} "
+                    "— run: wattfrosch-store migrate",
+                    file=sys.stderr,
+                )
+            else:
+                print("init: pending migrations: none", file=sys.stderr)
         else:  # pragma: no cover - subparsers are required
             parser.error(f"unknown command {args.command!r}")
     except ConfigError as exc:

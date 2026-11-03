@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import LiteralString, cast
 
 import psycopg
+from psycopg.rows import dict_row
 from wattfrosch_contracts import CONTRACT_VERSION
 
 from wattfrosch_store import StoreError
 from wattfrosch_store.config import Settings
-from wattfrosch_store.db import connect
+from wattfrosch_store.db import BOOTSTRAP_SQL, connect, translate_db_errors
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +34,6 @@ MIGRATE_LOCK_KEY = 0x77617474  # "watt", fixed documented constant
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "sql" / "migrations"
 
 _MIGRATION_NAME_RE = re.compile(r"^\d{4}_[a-z0-9_]+\.sql$")
-
-# Bootstrapped by init/the runner, never by a migration file.
-_BOOTSTRAP_SQL = """
-CREATE TABLE IF NOT EXISTS raw.schema_migration (
-    migration_id     text PRIMARY KEY,
-    contract_version text NOT NULL,
-    applied_at       timestamptz NOT NULL DEFAULT now()
-)
-"""
 
 
 class MigrationLockTimeoutError(StoreError):
@@ -60,6 +52,13 @@ class MigrationApplyError(StoreError):
 class MigrationResult:
     applied: tuple[str, ...]  # applied during this run, in file order
     skipped: tuple[str, ...]  # already applied before the run
+
+
+@dataclass(frozen=True)
+class InitResult:
+    db_created: bool
+    applied: tuple[str, ...]  # already applied before this init
+    pending: tuple[str, ...]  # waiting for ``migrate``
 
 
 def discover_migrations(directory: Path | None = None) -> tuple[Path, ...]:
@@ -135,8 +134,7 @@ def run_migrations(settings: Settings) -> MigrationResult:
             _acquire_lock(conn, cur, settings)
             locked = True
 
-            cur.execute("CREATE SCHEMA IF NOT EXISTS raw")
-            cur.execute(_BOOTSTRAP_SQL)
+            cur.execute(BOOTSTRAP_SQL)
             conn.commit()
 
             cur.execute("SELECT migration_id FROM raw.schema_migration")
@@ -179,3 +177,72 @@ def run_migrations(settings: Settings) -> MigrationResult:
             except psycopg.Error:
                 pass
         conn.close()
+
+
+def run_init(settings: Settings) -> InitResult:
+    """Create database, schema ``raw`` and the log table; never star-schema DDL.
+
+    Connects to the maintenance database ``postgres`` (deliberately not via
+    :func:`connect`, which targets the store database), creates the store
+    database if missing, then bootstraps schema and log table in the target
+    database and reports the migration status.
+    """
+    conninfo: dict[str, str | int] = {
+        key: value
+        for key, value in psycopg.conninfo.conninfo_to_dict(
+            settings.database_url
+        ).items()
+        if value is not None
+    }
+    target_db = cast(
+        "str", conninfo.get("dbname") or conninfo.get("user") or "postgres"
+    )
+
+    maintenance_dsn = psycopg.conninfo.make_conninfo(
+        settings.database_url, dbname="postgres"
+    )
+
+    with translate_db_errors():
+        with (
+            psycopg.connect(
+                maintenance_dsn,
+                autocommit=True,
+                row_factory=dict_row,
+            ) as maintenance,
+            maintenance.cursor() as cur,
+        ):
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
+            db_created = cur.fetchone() is None
+            if db_created:
+                logger.info("Creating database %s", target_db)
+                try:
+                    cur.execute(
+                        psycopg.sql.SQL("CREATE DATABASE {}").format(
+                            psycopg.sql.Identifier(target_db)
+                        )
+                    )
+                except psycopg.errors.DuplicateDatabase:
+                    db_created = False  # a parallel init won the race
+                except psycopg.errors.InsufficientPrivilege as exc:
+                    raise StoreError(
+                        "Missing CREATEDB privilege (SQLSTATE 42501). "
+                        "Hint: docker compose up -d db"
+                    ) from exc
+
+        conn = connect(settings)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(BOOTSTRAP_SQL)
+                conn.commit()
+                cur.execute("SELECT migration_id FROM raw.schema_migration")
+                applied_db = {row["migration_id"] for row in cur.fetchall()}
+                conn.commit()
+            pending, applied = _plan(discover_migrations(), applied_db)
+        finally:
+            conn.close()
+
+    return InitResult(
+        db_created=db_created,
+        applied=applied,
+        pending=tuple(f.stem for f in pending),
+    )
