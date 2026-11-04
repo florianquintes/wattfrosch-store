@@ -23,7 +23,7 @@ import psycopg
 from wattfrosch_contracts import CONTRACT_VERSION
 from wattfrosch_contracts.records import MeasurementRecord
 
-from wattfrosch_store import StoreError
+from wattfrosch_store import ContextStoreError, StoreError
 from wattfrosch_store.config import Settings, load_settings
 from wattfrosch_store.db import (
     SchemaMissingError,
@@ -72,14 +72,10 @@ DO UPDATE SET value = EXCLUDED.value, ingested_at = now()
 """
 
 
-class _LoadError(StoreError):
+class _LoadError(ContextStoreError):
     """Base for load errors carrying a store error code and context."""
 
     code: str
-
-    def __init__(self, message: str, context: dict[str, object]) -> None:
-        super().__init__(message)
-        self.context = context
 
 
 class RegionNotFoundError(_LoadError):
@@ -255,9 +251,11 @@ def load_records(
     try:
         conn = connect(settings)
     except StoreError as exc:
-        return _failed(exc, progress)
+        return _result(progress, "failed", exc)
     except psycopg.Error as exc:
-        return _failed(StoreConnectionError(f"Database not reachable: {exc}"), progress)
+        return _result(
+            progress, "failed", StoreConnectionError(f"Database not reachable: {exc}")
+        )
     try:
         with translate_db_errors():
             check_contract_version(conn)
@@ -280,39 +278,39 @@ def load_records(
                 progress.batches_total,
             )
             status = "ok"
-        return LoadResult(
-            status=status,
-            records_read=progress.records_read,
-            rows_written=progress.rows_written,
-            batches_committed=progress.batches_committed,
-            batches_total=progress.batches_total,
-            dims_inserted=progress.dims_inserted,
-            divergences=progress.divergences,
-            error=None,
-        )
+        return _result(progress, status, None)
     except psycopg.errors.UndefinedTable as exc:
         conn.rollback()
-        return _failed(
+        return _result(
+            progress,
+            "failed",
             SchemaMissingError(
                 f"Required table does not exist (SQLSTATE {exc.sqlstate}). "
                 "Run: wattfrosch-store migrate"
             ),
-            progress,
         )
     except StoreError as exc:
         conn.rollback()
-        return _failed(exc, progress)
+        return _result(progress, "failed", exc)
     except psycopg.Error as exc:
         conn.rollback()
-        return _failed(StoreError(f"Unexpected database error: {exc}"), progress)
+        return _result(
+            progress, "failed", StoreError(f"Unexpected database error: {exc}")
+        )
     finally:
         conn.close()
 
 
-def _failed(error: StoreError, progress: _Progress) -> LoadResult:
-    logger.error("Load failed: %s", error)
+def _result(
+    progress: _Progress,
+    status: Literal["ok", "empty", "failed"],
+    error: StoreError | None,
+) -> LoadResult:
+    """Build the ``LoadResult`` for the run's final state."""
+    if status == "failed":
+        logger.error("Load failed: %s", error)
     return LoadResult(
-        status="failed",
+        status=status,
         records_read=progress.records_read,
         rows_written=progress.rows_written,
         batches_committed=progress.batches_committed,
@@ -406,7 +404,7 @@ def _flush_batch(
     try:
         with conn.cursor() as cur:
             cur.executemany(_UPSERT_FACT_SQL, params)
-            written = cast("int", cur.rowcount)
+            written = cur.rowcount
         conn.commit()
     except psycopg.Error as exc:
         raise BatchFailedError(

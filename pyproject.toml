@@ -1,7 +1,7 @@
 [project]
 name = "wattfrosch-store"
 version = "0.1.0"
-description = "Persistenz-Modul: Datenbankschema, Migrationen und idempotenter Loader für MeasurementRecords."
+description = "Persistence module: database schema, migrations and an idempotent loader for MeasurementRecords."
 authors = [
     { name = "Dr. Florian Quintes", email = "florian@fam-quintes.de" }
 ]

@@ -87,72 +87,69 @@ class SyncResult:
     divergences: list[Divergence]
 
 
-def _sync_regions(conn: psycopg.Connection[dict]) -> int:
+def _sync_dimension(
+    conn: psycopg.Connection[dict],
+    sql: LiteralString,
+    params_rows: list[dict[str, object]],
+) -> int:
+    """Insert one dimension's catalog rows; returns the number inserted."""
     with conn.cursor() as cur:
         count = 0
-        for entry in REGIONS.values():
-            cur.execute(
-                _INSERT_REGION_SQL,
-                {
-                    "region_code": entry.code,
-                    "name": entry.name,
-                    "kind": entry.kind,
-                    "tz": entry.tz,
-                    "valid_from": entry.valid_from,
-                    "valid_to": entry.valid_to,
-                },
-            )
-            count += cast("int", cur.rowcount)
+        for params in params_rows:
+            cur.execute(sql, params)
+            count += cur.rowcount
     return count
+
+
+def _sync_regions(conn: psycopg.Connection[dict]) -> int:
+    return _sync_dimension(
+        conn,
+        _INSERT_REGION_SQL,
+        [
+            {
+                "region_code": entry.code,
+                "name": entry.name,
+                "kind": entry.kind,
+                "tz": entry.tz,
+                "valid_from": entry.valid_from,
+                "valid_to": entry.valid_to,
+            }
+            for entry in REGIONS.values()
+        ],
+    )
 
 
 def _sync_metrics(conn: psycopg.Connection[dict]) -> int:
-    with conn.cursor() as cur:
-        count = 0
-        for entry in METRICS.values():
-            plausible_min, plausible_max = None, None
-            if entry.plausible_range is not None:
-                plausible_min, plausible_max = entry.plausible_range
-            cur.execute(
-                _INSERT_METRIC_SQL,
-                {
-                    "metric_key": entry.key,
-                    "unit": entry.unit,
-                    "category": entry.category,
-                    "aggregation": entry.aggregation,
-                    "is_derived": entry.derived,
-                    "is_renewable": entry.is_renewable,
-                    "can_be_negative": entry.can_be_negative,
-                    "plausible_min": plausible_min,
-                    "plausible_max": plausible_max,
-                    "display_name": entry.display_name,
-                    "description": entry.description,
-                    "valid_from": entry.valid_from,
-                    "valid_to": entry.valid_to,
-                },
-            )
-            count += cast("int", cur.rowcount)
-    return count
+    return _sync_dimension(
+        conn,
+        _INSERT_METRIC_SQL,
+        [_metric_params(entry) for entry in METRICS.values()],
+    )
 
 
 def _sync_sources(conn: psycopg.Connection[dict]) -> int:
-    with conn.cursor() as cur:
-        count = 0
-        for source_key, entry in SOURCES.items():
-            cur.execute(
-                _INSERT_SOURCE_SQL,
-                {
-                    "source_key": source_key,
-                    "name": entry.name,
-                    "license": entry.license,
-                    "url": entry.url,
-                },
-            )
-            count += cast("int", cur.rowcount)
-    return count
+    return _sync_dimension(
+        conn,
+        _INSERT_SOURCE_SQL,
+        [
+            {
+                "source_key": source_key,
+                "name": entry.name,
+                "license": entry.license,
+                "url": entry.url,
+            }
+            for source_key, entry in SOURCES.items()
+        ],
+    )
 
 
 # --- shared read-only catalog-vs-DB comparison (sync: warn, verify: hard) ---
+
+
+def _plausible_bounds(entry: MetricEntry) -> tuple[object, object]:
+    if entry.plausible_range is None:
+        return None, None
+    return entry.plausible_range
 
 
 def _region_row(entry: RegionEntry) -> dict[str, object]:
@@ -165,9 +162,7 @@ def _region_row(entry: RegionEntry) -> dict[str, object]:
 
 
 def _metric_row(entry: MetricEntry) -> dict[str, object]:
-    plausible_min, plausible_max = None, None
-    if entry.plausible_range is not None:
-        plausible_min, plausible_max = entry.plausible_range
+    plausible_min, plausible_max = _plausible_bounds(entry)
     return {
         "unit": entry.unit,
         "category": entry.category,
@@ -180,6 +175,14 @@ def _metric_row(entry: MetricEntry) -> dict[str, object]:
         "display_name": entry.display_name,
         "description": entry.description,
         "valid_to": entry.valid_to,
+    }
+
+
+def _metric_params(entry: MetricEntry) -> dict[str, object]:
+    return {
+        "metric_key": entry.key,
+        **_metric_row(entry),
+        "valid_from": entry.valid_from,
     }
 
 

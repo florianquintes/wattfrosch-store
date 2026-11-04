@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import cast
 
@@ -50,20 +50,33 @@ class SchemaMissingError(StoreError):
     """The schema ``raw`` does not exist."""
 
 
-def _translate_connect_error(
-    exc: psycopg.Error,
-) -> StoreError | psycopg.Error:
+def _translate_sqlstate(exc: psycopg.Error) -> StoreError | None:
+    """Map a psycopg error's SQLSTATE to a typed store error, or ``None``."""
     sqlstate = getattr(exc, "sqlstate", None)
     if sqlstate == "3D000":
         return DatabaseMissingError(
             "Database does not exist (SQLSTATE 3D000). Run: wattfrosch-store init"
+        )
+    if sqlstate == "3F000":
+        return SchemaMissingError(
+            "Schema 'raw' does not exist (SQLSTATE 3F000). "
+            "Run: wattfrosch-store migrate"
         )
     if sqlstate in _UNREACHABLE_SQLSTATES or sqlstate is None:
         return StoreConnectionError(
             f"Database not reachable (SQLSTATE {sqlstate or 'unknown'}). "
             f"Hint: docker compose up -d db"
         )
-    return exc
+    return None
+
+
+def _translate_connect_error(
+    exc: psycopg.Error,
+) -> StoreError | psycopg.Error:
+    # 3F000 (schema missing) cannot occur at connect time; any other mapped
+    # SQLSTATE is a database-level problem that also applies while connecting.
+    translated = _translate_sqlstate(exc)
+    return translated if translated is not None else exc
 
 
 def connect(settings: Settings) -> psycopg.Connection[dict]:
@@ -106,7 +119,7 @@ def connect(settings: Settings) -> psycopg.Connection[dict]:
 
 
 @contextmanager
-def translate_db_errors() -> Iterator[None]:
+def translate_db_errors() -> Generator[None]:
     """Translate query-phase SQLSTATEs into typed store errors.
 
     Wrap the first queries that touch the store database (schema ``raw``);
@@ -116,19 +129,7 @@ def translate_db_errors() -> Iterator[None]:
     try:
         yield
     except psycopg.Error as exc:
-        sqlstate = getattr(exc, "sqlstate", None)
-        if sqlstate == "3F000":
-            raise SchemaMissingError(
-                "Schema 'raw' does not exist (SQLSTATE 3F000). "
-                "Run: wattfrosch-store migrate"
-            ) from exc
-        if sqlstate == "3D000":
-            raise DatabaseMissingError(
-                "Database does not exist (SQLSTATE 3D000). Run: wattfrosch-store init"
-            ) from exc
-        if sqlstate in _UNREACHABLE_SQLSTATES or sqlstate is None:
-            raise StoreConnectionError(
-                f"Database not reachable (SQLSTATE {sqlstate or 'unknown'}). "
-                f"Hint: docker compose up -d db"
-            ) from exc
-        raise
+        translated = _translate_sqlstate(exc)
+        if translated is None:
+            raise
+        raise translated from exc

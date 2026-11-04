@@ -12,8 +12,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DATABASE_URL = "postgresql://wattfrosch:wattfrosch@localhost:5432/wattfrosch"
 
-Duration = timedelta
-
 _DURATION_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>[smh])$")
 
 _UNIT_SECONDS = {
@@ -44,7 +42,7 @@ class Settings(BaseSettings):
     database_url: str = DEFAULT_DATABASE_URL
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     batch_size: int = Field(default=1000, ge=1)
-    migrate_lock_timeout: Duration = timedelta(seconds=30)
+    migrate_lock_timeout: timedelta = timedelta(seconds=30)
 
     @field_validator("migrate_lock_timeout", mode="before")
     @classmethod

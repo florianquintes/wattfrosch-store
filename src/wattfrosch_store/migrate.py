@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import LiteralString, cast
 
 import psycopg
+import psycopg.sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 from wattfrosch_contracts import CONTRACT_VERSION
 
@@ -57,7 +59,9 @@ class MigrationResult:
 @dataclass(frozen=True)
 class InitResult:
     db_created: bool
-    applied: tuple[str, ...]  # already applied before this init
+    # Already applied *before* this init — not "applied by init" (init never
+    # applies star-schema DDL; that is migrate's job, see MigrationResult).
+    applied: tuple[str, ...]
     pending: tuple[str, ...]  # waiting for ``migrate``
 
 
@@ -189,18 +193,14 @@ def run_init(settings: Settings) -> InitResult:
     """
     conninfo: dict[str, str | int] = {
         key: value
-        for key, value in psycopg.conninfo.conninfo_to_dict(
-            settings.database_url
-        ).items()
+        for key, value in conninfo_to_dict(settings.database_url).items()
         if value is not None
     }
     target_db = cast(
         "str", conninfo.get("dbname") or conninfo.get("user") or "postgres"
     )
 
-    maintenance_dsn = psycopg.conninfo.make_conninfo(
-        settings.database_url, dbname="postgres"
-    )
+    maintenance_dsn = make_conninfo(settings.database_url, dbname="postgres")
 
     with translate_db_errors():
         with (
@@ -237,12 +237,14 @@ def run_init(settings: Settings) -> InitResult:
                 cur.execute("SELECT migration_id FROM raw.schema_migration")
                 applied_db = {row["migration_id"] for row in cur.fetchall()}
                 conn.commit()
-            pending, applied = _plan(discover_migrations(), applied_db)
+            # _plan's second value is the *skipped* set: files already applied
+            # before this init (init never applies migrations itself).
+            pending, already_applied = _plan(discover_migrations(), applied_db)
         finally:
             conn.close()
 
     return InitResult(
         db_created=db_created,
-        applied=applied,
+        applied=already_applied,
         pending=tuple(f.stem for f in pending),
     )

@@ -27,7 +27,7 @@ import pyarrow.parquet as pq
 from pydantic import ValidationError
 from wattfrosch_contracts.records import MeasurementRecord
 
-from wattfrosch_store import StoreError
+from wattfrosch_store import ContextStoreError
 from wattfrosch_store.config import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -43,14 +43,10 @@ class UnsupportedFormatError(ConfigError):
     """The file extension is not one of the supported import formats."""
 
 
-class RecordValidationError(StoreError):
+class RecordValidationError(ContextStoreError):
     """A record in the input file failed strict validation."""
 
     code = "wattfrosch.store_validation_failed"
-
-    def __init__(self, message: str, context: dict[str, object]) -> None:
-        super().__init__(message)
-        self.context = context
 
 
 def read_records(path: Path) -> Iterator[MeasurementRecord]:
@@ -58,8 +54,8 @@ def read_records(path: Path) -> Iterator[MeasurementRecord]:
 
     The format is detected by the file extension. Reading is streaming for
     all formats; the caller decides how much to consume (a partially
-    consumed generator simply leaves the file to be closed by the garbage
-    collector).
+    consumed generator closes its file handles when it is closed or
+    collected).
 
     Extension and (for parquet) the file footer are validated eagerly —
     before the first record is requested — so a wrong or unreadable input
@@ -82,11 +78,14 @@ def read_records(path: Path) -> Iterator[MeasurementRecord]:
 def _iter_parquet(
     parquet_file: pq.ParquetFile, path: Path
 ) -> Iterator[MeasurementRecord]:
-    ordinal = 0  # parquet has no file lines; report the record ordinal
-    for batch in parquet_file.iter_batches(batch_size=_READ_BATCH_SIZE):
-        for row in batch.to_pylist():
-            ordinal += 1
-            yield _validated(row, ordinal, path)
+    try:
+        ordinal = 0  # parquet has no file lines; report the record ordinal
+        for batch in parquet_file.iter_batches(batch_size=_READ_BATCH_SIZE):
+            for row in batch.to_pylist():
+                ordinal += 1
+                yield _validated(row, ordinal, path)
+    finally:
+        parquet_file.close()
 
 
 def _iter_csv(path: Path) -> Iterator[MeasurementRecord]:
