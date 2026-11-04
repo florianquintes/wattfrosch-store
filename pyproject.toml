@@ -24,9 +24,9 @@ build-backend = "uv_build"
 wattfrosch-contracts = { path = "../wattfrosch-contracts", editable = true }
 
 [tool.ruff]
-# README.md ist die autoritative Spec — ihre handausgerichteten Codeblock-Kommentare
-# nicht umbrechen (ruff format prüft Python-Blöcke in Markdown).
-extend-exclude = ["README.md"]
+# README.md and docs/design.md contain hand-aligned code-block comments
+# and spec DDL — do not reflow (ruff format checks Python blocks in Markdown).
+extend-exclude = ["README.md", "docs/design.md"]
 
 [tool.pyrefly]
 project-includes = ["src"]
