@@ -1,0 +1,2 @@
+ts_utc,region,metric,value,source,resolution
+2018-06-01T00:00:00Z,DE-LU,generation.solar,42.0,energy-charts,PT1H

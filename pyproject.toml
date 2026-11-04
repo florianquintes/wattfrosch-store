@@ -1,7 +1,7 @@
 [project]
 name = "wattfrosch-store"
 version = "0.1.0"
-description = "Persistenz-Modul: Datenbankschema, Migrationen und idempotenter Loader für MeasurementRecords."
+description = "Persistence module: database schema, migrations and an idempotent loader for MeasurementRecords."
 authors = [
     { name = "Dr. Florian Quintes", email = "florian@fam-quintes.de" }
 ]
@@ -24,9 +24,9 @@ build-backend = "uv_build"
 wattfrosch-contracts = { path = "../wattfrosch-contracts", editable = true }
 
 [tool.ruff]
-# README.md ist die autoritative Spec — ihre handausgerichteten Codeblock-Kommentare
-# nicht umbrechen (ruff format prüft Python-Blöcke in Markdown).
-extend-exclude = ["README.md"]
+# README.md and docs/design.md contain hand-aligned code-block comments
+# and spec DDL — do not reflow (ruff format checks Python blocks in Markdown).
+extend-exclude = ["README.md", "docs/design.md"]
 
 [tool.pyrefly]
 project-includes = ["src"]
@@ -37,6 +37,11 @@ source = ["wattfrosch_store"]
 [tool.coverage.report]
 fail_under = 90
 show_missing = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests against a real Postgres (compose DB or testcontainer)",
+]
 
 [dependency-groups]
 dev = [
