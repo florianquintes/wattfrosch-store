@@ -63,7 +63,7 @@ uv sync --locked
 ```
 
 The contract version is checked on every load (major.minor comparison; patches
-are accepted) and aborts with `wattfrosch.store_contract_version_error` on
+are accepted) and aborts with `wattfrosch.store_contract_divergence` on
 mismatch.
 
 ## Usage
@@ -85,7 +85,9 @@ CLI flags:
 |---|---|
 | `--from-file` | required for `load`; production writes go through the pipeline, so `load` without it is a usage error (exit 1) |
 | `--check-values` | optional for `verify`; full-scan plausibility check of `value` against `dim_metric.plausible_min/max` |
-| `--batch-size` | optional for `load`; records per transaction (default `BATCH_SIZE`) |
+
+Batch size is configured via the `BATCH_SIZE` environment variable (see below),
+not via a CLI flag.
 
 The file format is detected by extension: `.parquet`, `.csv`,
 `.ndjson`/`.json`. An unknown extension aborts with the list of supported
